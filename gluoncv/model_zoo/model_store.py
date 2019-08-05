@@ -23,6 +23,8 @@ _model_sha1 = {name: checksum for checksum, name in [
     ('b56e3d1c33eb52d0b90678db4ce6c5ca6c9a6704', 'mobilenetv2_0.75'),
     ('0803818513599fa1329524ee3607b708b4a4630f', 'mobilenetv2_0.5'),
     ('9b1d2cc38fed4cd171a7f7a0d17fe1a905573887', 'mobilenetv2_0.25'),
+    ('eaa44578554ddffaf2a2630ced9093181ff79688', 'mobilenetv3_large'),
+    ('33c100a740c0a278ec06e8640b19f52b744d1f11', 'mobilenetv3_small'),
     ('a0666292f0a30ff61f857b0b66efc0228eb6a54b', 'resnet18_v1'),
     ('48216ba99a8b1005d75c0f3a0c422301a0473233', 'resnet34_v1'),
     ('cc729d95031ca98cf2ff362eb57dee4d9994e4b2', 'resnet50_v1'),
@@ -131,6 +133,9 @@ _model_sha1 = {name: checksum for checksum, name in [
     ('6a25eeceb7d27bd9c05fa2bf250c55d3960ad4c7', 'resnet50_v1d_8.8x'),
     ('a872796b63fb883116831db3454711421a628154', 'resnet101_v1d_1.9x'),
     ('712fccb185921a596baebe9246ff6c994b88591b', 'resnet101_v1d_2.2x'),
+    ('d6dc1bbaaf3cbe0be19f02362706393f62ce76fa', 'vgg16_ucf101'),
+    ('13ef5c3bd40141f11c5b4e471f8f2ad0c1ac6299', 'inceptionv3_ucf101'),
+    ('de56b871543847d586deeca488b5bfe1b77bb5c5', 'alpha_pose_resnet101_v1b_coco'),
 ]}
 
 apache_repo_url = 'https://apache-mxnet.s3-accelerate.dualstack.amazonaws.com/'
@@ -221,4 +226,14 @@ def purge(root=os.path.join('~', '.mxnet', 'models')):
 
 
 def pretrained_model_list():
-    return list(_model_sha1.keys())
+    """Get list of model which has pretrained weights available."""
+    _renames = {
+        'resnet18_v1b_2.6x': 'resnet18_v1b_0.89',
+        'resnet50_v1d_1.8x': 'resnet50_v1d_0.86',
+        'resnet50_v1d_3.6x': 'resnet50_v1d_0.48',
+        'resnet50_v1d_5.9x': 'resnet50_v1d_0.37',
+        'resnet50_v1d_8.8x': 'resnet50_v1d_0.11',
+        'resnet101_v1d_1.9x': 'resnet101_v1d_0.76',
+        'resnet101_v1d_2.2x': 'resnet101_v1d_0.73',
+    }
+    return [_renames[x] if x in _renames else x for x in _model_sha1.keys()]

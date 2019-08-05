@@ -13,6 +13,7 @@ from .fcn import *
 from .inception import *
 from .mask_rcnn import *
 from .mobilenet import *
+from .mobilenetv3 import *
 from .nasnet import *
 from .pruned_resnet.resnetv1b_pruned import *
 from .pspnet import *
@@ -28,6 +29,8 @@ from .squeezenet import *
 from .ssd import *
 from .vgg import *
 from .yolo import *
+from .alpha_pose import *
+from .action_recognition import *
 
 __all__ = ['get_model', 'get_model_list']
 
@@ -78,6 +81,8 @@ _models = {
     'mobilenetv2_0.75': mobilenet_v2_0_75,
     'mobilenetv2_0.5': mobilenet_v2_0_5,
     'mobilenetv2_0.25': mobilenet_v2_0_25,
+    'mobilenetv3_large' : mobilenet_v3_large,
+    'mobilenetv3_small' : mobilenet_v3_small,
     'ssd_300_vgg16_atrous_voc': ssd_300_vgg16_atrous_voc,
     'ssd_300_vgg16_atrous_coco': ssd_300_vgg16_atrous_coco,
     'ssd_300_vgg16_atrous_custom': ssd_300_vgg16_atrous_custom,
@@ -211,6 +216,9 @@ _models = {
     'ssd_512_mobilenet1.0_voc_int8': ssd_512_mobilenet1_0_voc_int8,
     'ssd_512_resnet50_v1_voc_int8': ssd_512_resnet50_v1_voc_int8,
     'ssd_512_vgg16_atrous_voc_int8': ssd_512_vgg16_atrous_voc_int8,
+    'alpha_pose_resnet101_v1b_coco': alpha_pose_resnet101_v1b_coco,
+    'vgg16_ucf101': vgg16_ucf101,
+    'inceptionv3_ucf101': inceptionv3_ucf101,
 }
 
 
