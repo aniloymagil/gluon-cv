@@ -179,6 +179,8 @@ class FPNFeatureExpander(SymbolBlock):
         Whether to use element-wise add operation
     use_p6 : bool
         Whether use P6 stage, this is used for RPN experiments in ori paper
+    p6_conv : bool
+        Whether to use convolution for P6 stage, if it is enabled, or just max pooling.
     no_bias : bool
         Whether use bias for Convolution operation.
     norm_layer : HybridBlock or SymbolBlock
@@ -195,9 +197,8 @@ class FPNFeatureExpander(SymbolBlock):
     """
 
     def __init__(self, network, outputs, num_filters, use_1x1=True, use_upsample=True,
-                 use_elewadd=True, use_p6=False, no_bias=True, pretrained=False, norm_layer=None,
-                 norm_kwargs=None, ctx=mx.cpu(),
-                 inputs=('data',)):
+                 use_elewadd=True, use_p6=False, p6_conv=True, no_bias=True, pretrained=False,
+                 norm_layer=None, norm_kwargs=None, ctx=mx.cpu(), inputs=('data',)):
         inputs, outputs, params = _parse_network(network, outputs, inputs, pretrained, ctx)
         if norm_kwargs is None:
             norm_kwargs = {}
@@ -209,7 +210,7 @@ class FPNFeatureExpander(SymbolBlock):
         y = outputs[-1]
         base_features = outputs[::-1]
         num_stages = len(num_filters) + 1  # usually 5
-        weight_init = mx.init.Xavier(rnd_type='gaussian', factor_type='out', magnitude=2.)
+        weight_init = mx.init.Xavier(rnd_type='uniform', factor_type='in', magnitude=1.)
         tmp_outputs = []
         # num_filter is 256 in ori paper
         for i, (bf, f) in enumerate(zip(base_features, num_filters)):
@@ -224,10 +225,7 @@ class FPNFeatureExpander(SymbolBlock):
                             norm_kwargs['key'] = "P{}_lat_bn".format(num_stages - i)
                             norm_kwargs['name'] = "P{}_lat_bn".format(num_stages - i)
                         y = norm_layer(y, **norm_kwargs)
-                if use_p6:
-                    # method 1 : use max pool (Detectron use this)
-                    # y_p6 = mx.sym.Pooling(y, pool_type='max', kernel=(1, 1), pad=(0, 0),
-                    #                       stride=(2, 2), name="P{}_pre".format(num_stages+1))
+                if use_p6 and p6_conv:
                     # method 2 : use conv (Deformable use this)
                     y_p6 = mx.sym.Convolution(y, num_filter=f, kernel=(3, 3), pad=(1, 1),
                                               stride=(2, 2), no_bias=no_bias,
@@ -258,13 +256,17 @@ class FPNFeatureExpander(SymbolBlock):
                     # method 1 : mx.sym.Crop
                     # y = mx.sym.Crop(*[y, bf], name="P{}_clip".format(num_stages-i))
                     # method 2 : mx.sym.slice_like
-                    y = mx.sym.slice_like(y, bf * 0, axes=(2, 3),
+                    y = mx.sym.slice_like(y, bf, axes=(2, 3),
                                           name="P{}_clip".format(num_stages - i))
                     y = mx.sym.ElementWiseSum(bf, y, name="P{}_sum".format(num_stages - i))
             # Reduce the aliasing effect of upsampling described in ori paper
             out = mx.sym.Convolution(y, num_filter=f, kernel=(3, 3), pad=(1, 1), stride=(1, 1),
                                      no_bias=no_bias, name='P{}_conv1'.format(num_stages - i),
                                      attr={'__init__': weight_init})
+            if i == 0 and use_p6 and not p6_conv:
+                # method 2 : use max pool (Detectron use this)
+                y_p6 = mx.sym.Pooling(out, pool_type='max', kernel=(1, 1), pad=(0, 0),
+                                      stride=(2, 2), name="P{}_pre".format(num_stages + 1))
             if norm_layer is not None:
                 if norm_layer is SyncBatchNorm:
                     norm_kwargs['key'] = "P{}_bn".format(num_stages - i)

@@ -15,16 +15,20 @@ import gluoncv as gcv
 from gluoncv import data as gdata
 from gluoncv import utils as gutils
 from gluoncv.model_zoo import get_model
-from gluoncv.data import batchify
+from gluoncv.data.batchify import FasterRCNNTrainBatchify, Tuple, Append
 from gluoncv.data.transforms.presets.rcnn import FasterRCNNDefaultTrainTransform, \
     FasterRCNNDefaultValTransform
 from gluoncv.utils.metrics.voc_detection import VOC07MApMetric
 from gluoncv.utils.metrics.coco_detection import COCODetectionMetric
+from gluoncv.utils.parallel import Parallelizable, Parallel
+from gluoncv.utils.metrics.rcnn import RPNAccMetric, RPNL1LossMetric, RCNNAccMetric, \
+    RCNNL1LossMetric
 
 try:
     import horovod.mxnet as hvd
 except ImportError:
     hvd = None
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Faster-RCNN networks e2e.')
@@ -36,6 +40,7 @@ def parse_args():
                         default=4, help='Number of data workers, you can use larger '
                                         'number to accelerate data loading, '
                                         'if your CPU and GPUs are powerful.')
+    parser.add_argument('--batch-size', type=int, default=8, help='Training mini-batch size.')
     parser.add_argument('--gpus', type=str, default='0',
                         help='Training with GPUs, you can specify 1,3 for example.')
     parser.add_argument('--epochs', type=str, default='',
@@ -54,6 +59,8 @@ def parse_args():
                         help='epochs at which learning rate decays. default is 14,20 for voc.')
     parser.add_argument('--lr-warmup', type=str, default='',
                         help='warmup iterations to adjust learning rate, default is 0 for voc.')
+    parser.add_argument('--lr-warmup-factor', type=float, default=1. / 3.,
+                        help='warmup factor of base lr.')
     parser.add_argument('--momentum', type=float, default=0.9,
                         help='SGD momentum, default is 0.9')
     parser.add_argument('--wd', type=str, default='',
@@ -80,7 +87,8 @@ def parse_args():
                         help='Type of normalization layer to use. '
                              'If set to None, backbone normalization layer will be fixed,'
                              ' and no normalization layer will be used. '
-                             'Currently supports \'bn\', and None, default is None')
+                             'Currently supports \'bn\', and None, default is None.'
+                             'Note that if horovod is enabled, sync bn will not work correctly.')
 
     # FPN options
     parser.add_argument('--use-fpn', action='store_true',
@@ -96,9 +104,15 @@ def parse_args():
                         help='Use MXNet AMP for mixed precision training.')
     parser.add_argument('--horovod', action='store_true',
                         help='Use MXNet Horovod for distributed training. Must be run with OpenMPI. '
-                        '--gpus is ignored when using --horovod.')
-
-
+                             '--gpus is ignored when using --horovod.')
+    parser.add_argument('--executor-threads', type=int, default=1,
+                        help='Number of threads for executor for scheduling ops. '
+                             'More threads may incur higher GPU memory footprint, '
+                             'but may speed up throughput. Note that when horovod is used, '
+                             'it is set to 1.')
+    parser.add_argument('--kv-store', type=str, default='nccl',
+                        help='KV store options. local, device, nccl, dist_sync, dist_device_sync, '
+                             'dist_async are available.')
 
     args = parser.parse_args()
 
@@ -116,99 +130,10 @@ def parse_args():
     elif args.dataset == 'coco':
         args.epochs = int(args.epochs) if args.epochs else 26
         args.lr_decay_epoch = args.lr_decay_epoch if args.lr_decay_epoch else '17,23'
-        args.lr = float(args.lr) if args.lr else 0.00125
-        args.lr_warmup = args.lr_warmup if args.lr_warmup else 8000
+        args.lr = float(args.lr) if args.lr else 0.01
+        args.lr_warmup = args.lr_warmup if args.lr_warmup else 1000
         args.wd = float(args.wd) if args.wd else 1e-4
-        num_gpus = hvd.size() if args.horovod else len(args.gpus.split(','))
-        if num_gpus == 1:
-            args.lr_warmup = -1
-        else:
-            args.lr *= num_gpus
-            args.lr_warmup /= num_gpus
     return args
-
-
-class RPNAccMetric(mx.metric.EvalMetric):
-    def __init__(self):
-        super(RPNAccMetric, self).__init__('RPNAcc')
-
-    def update(self, labels, preds):
-        # label: [rpn_label, rpn_weight]
-        # preds: [rpn_cls_logits]
-        rpn_label, rpn_weight = labels
-        rpn_cls_logits = preds[0]
-
-        # calculate num_inst (average on those fg anchors)
-        num_inst = mx.nd.sum(rpn_weight)
-
-        # cls_logits (b, c, h, w) red_label (b, 1, h, w)
-        # pred_label = mx.nd.argmax(rpn_cls_logits, axis=1, keepdims=True)
-        pred_label = mx.nd.sigmoid(rpn_cls_logits) >= 0.5
-        # label (b, 1, h, w)
-        num_acc = mx.nd.sum((pred_label == rpn_label) * rpn_weight)
-
-        self.sum_metric += num_acc.asscalar()
-        self.num_inst += num_inst.asscalar()
-
-
-class RPNL1LossMetric(mx.metric.EvalMetric):
-    def __init__(self):
-        super(RPNL1LossMetric, self).__init__('RPNL1Loss')
-
-    def update(self, labels, preds):
-        # label = [rpn_bbox_target, rpn_bbox_weight]
-        # pred = [rpn_bbox_reg]
-        rpn_bbox_target, rpn_bbox_weight = labels
-        rpn_bbox_reg = preds[0]
-
-        # calculate num_inst (average on those fg anchors)
-        num_inst = mx.nd.sum(rpn_bbox_weight) / 4
-
-        # calculate smooth_l1
-        loss = mx.nd.sum(
-            rpn_bbox_weight * mx.nd.smooth_l1(rpn_bbox_reg - rpn_bbox_target, scalar=3))
-
-        self.sum_metric += loss.asscalar()
-        self.num_inst += num_inst.asscalar()
-
-
-class RCNNAccMetric(mx.metric.EvalMetric):
-    def __init__(self):
-        super(RCNNAccMetric, self).__init__('RCNNAcc')
-
-    def update(self, labels, preds):
-        # label = [rcnn_label]
-        # pred = [rcnn_cls]
-        rcnn_label = labels[0]
-        rcnn_cls = preds[0]
-
-        # calculate num_acc
-        pred_label = mx.nd.argmax(rcnn_cls, axis=-1)
-        num_acc = mx.nd.sum(pred_label == rcnn_label)
-
-        self.sum_metric += num_acc.asscalar()
-        self.num_inst += rcnn_label.size
-
-
-class RCNNL1LossMetric(mx.metric.EvalMetric):
-    def __init__(self):
-        super(RCNNL1LossMetric, self).__init__('RCNNL1Loss')
-
-    def update(self, labels, preds):
-        # label = [rcnn_bbox_target, rcnn_bbox_weight]
-        # pred = [rcnn_reg]
-        rcnn_bbox_target, rcnn_bbox_weight = labels
-        rcnn_bbox_reg = preds[0]
-
-        # calculate num_inst
-        num_inst = mx.nd.sum(rcnn_bbox_weight) / 4
-
-        # calculate smooth_l1
-        loss = mx.nd.sum(
-            rcnn_bbox_weight * mx.nd.smooth_l1(rcnn_bbox_reg - rcnn_bbox_target, scalar=1))
-
-        self.sum_metric += loss.asscalar()
-        self.num_inst += num_inst.asscalar()
 
 
 def get_dataset(dataset, args):
@@ -231,21 +156,27 @@ def get_dataset(dataset, args):
 
 
 def get_dataloader(net, train_dataset, val_dataset, train_transform, val_transform, batch_size,
-                   args):
+                   num_shards, args):
     """Get dataloader."""
-    train_bfn = batchify.Tuple(*[batchify.Append() for _ in range(5)])
-    train_sampler = gcv.nn.sampler.SplitSampler(len(train_dataset), hvd.size(), hvd.rank()) if args.horovod else None
-    train_loader = mx.gluon.data.DataLoader(
-        train_dataset.transform(
-            train_transform(net.short, net.max_size, net, ashape=net.ashape,
-                            multi_stage=args.use_fpn)),
-        batch_size, train_sampler is None, sampler=train_sampler, batchify_fn=train_bfn,
-        last_batch='rollover', num_workers=args.num_workers)
-    val_bfn = batchify.Tuple(*[batchify.Append() for _ in range(3)])
+    train_bfn = FasterRCNNTrainBatchify(net, num_shards)
+    if hasattr(train_dataset, 'get_im_aspect_ratio'):
+        im_aspect_ratio = train_dataset.get_im_aspect_ratio()
+    else:
+        im_aspect_ratio = [1.] * len(train_dataset)
+    train_sampler = \
+        gcv.nn.sampler.SplitSortedBucketSampler(im_aspect_ratio, batch_size,
+                                                num_parts=hvd.size() if args.horovod else 1,
+                                                part_index=hvd.rank() if args.horovod else 0,
+                                                shuffle=True)
+    train_loader = mx.gluon.data.DataLoader(train_dataset.transform(
+        train_transform(net.short, net.max_size, net, ashape=net.ashape, multi_stage=args.use_fpn)),
+        batch_sampler=train_sampler, batchify_fn=train_bfn, num_workers=args.num_workers)
+    val_bfn = Tuple(*[Append() for _ in range(3)])
     short = net.short[-1] if isinstance(net.short, (tuple, list)) else net.short
+    # validation use 1 sample per device
     val_loader = mx.gluon.data.DataLoader(
-        val_dataset.transform(val_transform(short, net.max_size)),
-        batch_size, False, batchify_fn=val_bfn, last_batch='keep', num_workers=args.num_workers)
+        val_dataset.transform(val_transform(short, net.max_size)), num_shards, False,
+        batchify_fn=val_bfn, last_batch='keep', num_workers=args.num_workers)
     return train_loader, val_loader
 
 
@@ -266,10 +197,12 @@ def save_params(net, logger, best_map, current_map, epoch, save_interval, prefix
 
 def split_and_load(batch, ctx_list):
     """Split data to 1 batch each device."""
-    num_ctx = len(ctx_list)
     new_batch = []
     for i, data in enumerate(batch):
-        new_data = [x.as_in_context(ctx) for x, ctx in zip(data, ctx_list)]
+        if isinstance(data, (list, tuple)):
+            new_data = [x.as_in_context(ctx) for x, ctx in zip(data, ctx_list)]
+        else:
+            new_data = [data.as_in_context(ctx_list[0])]
         new_batch.append(new_data)
     return new_batch
 
@@ -279,6 +212,7 @@ def validate(net, val_data, ctx, eval_metric, args):
     clipper = gcv.nn.bbox.BBoxClipToImage()
     eval_metric.reset()
     if not args.disable_hybridization:
+        # input format is differnet than training, thus rehybridization is needed.
         net.hybridize(static_alloc=args.static_alloc)
     for batch in val_data:
         batch = split_and_load(batch, ctx_list=ctx)
@@ -312,26 +246,87 @@ def validate(net, val_data, ctx, eval_metric, args):
     return eval_metric.get()
 
 
-def get_lr_at_iter(alpha):
-    return 1. / 3. * (1 - alpha) + alpha
+def get_lr_at_iter(alpha, lr_warmup_factor=1. / 3.):
+    return lr_warmup_factor * (1 - alpha) + alpha
 
 
-def train(net, train_data, val_data, eval_metric, ctx, args):
+class ForwardBackwardTask(Parallelizable):
+    def __init__(self, net, optimizer, rpn_cls_loss, rpn_box_loss, rcnn_cls_loss, rcnn_box_loss,
+                 mix_ratio):
+        super(ForwardBackwardTask, self).__init__()
+        self.net = net
+        self._optimizer = optimizer
+        self.rpn_cls_loss = rpn_cls_loss
+        self.rpn_box_loss = rpn_box_loss
+        self.rcnn_cls_loss = rcnn_cls_loss
+        self.rcnn_box_loss = rcnn_box_loss
+        self.mix_ratio = mix_ratio
+
+    def forward_backward(self, x):
+        data, label, rpn_cls_targets, rpn_box_targets, rpn_box_masks = x
+        with autograd.record():
+            gt_label = label[:, :, 4:5]
+            gt_box = label[:, :, :4]
+            cls_pred, box_pred, roi, samples, matches, rpn_score, rpn_box, anchors, cls_targets, \
+                box_targets, box_masks, _ = net(data, gt_box, gt_label)
+            # losses of rpn
+            rpn_score = rpn_score.squeeze(axis=-1)
+            num_rpn_pos = (rpn_cls_targets >= 0).sum()
+            rpn_loss1 = self.rpn_cls_loss(rpn_score, rpn_cls_targets,
+                                          rpn_cls_targets >= 0) * rpn_cls_targets.size / num_rpn_pos
+            rpn_loss2 = self.rpn_box_loss(rpn_box, rpn_box_targets,
+                                          rpn_box_masks) * rpn_box.size / num_rpn_pos
+            # rpn overall loss, use sum rather than average
+            rpn_loss = rpn_loss1 + rpn_loss2
+            # losses of rcnn
+            num_rcnn_pos = (cls_targets >= 0).sum()
+            rcnn_loss1 = self.rcnn_cls_loss(cls_pred, cls_targets,
+                                            cls_targets.expand_dims(-1) >= 0) * cls_targets.size / \
+                         num_rcnn_pos
+            rcnn_loss2 = self.rcnn_box_loss(box_pred, box_targets, box_masks) * box_pred.size / \
+                         num_rcnn_pos
+            rcnn_loss = rcnn_loss1 + rcnn_loss2
+            # overall losses
+            total_loss = rpn_loss.sum() * self.mix_ratio + rcnn_loss.sum() * self.mix_ratio
+
+            rpn_loss1_metric = rpn_loss1.mean() * self.mix_ratio
+            rpn_loss2_metric = rpn_loss2.mean() * self.mix_ratio
+            rcnn_loss1_metric = rcnn_loss1.mean() * self.mix_ratio
+            rcnn_loss2_metric = rcnn_loss2.mean() * self.mix_ratio
+            rpn_acc_metric = [[rpn_cls_targets, rpn_cls_targets >= 0], [rpn_score]]
+            rpn_l1_loss_metric = [[rpn_box_targets, rpn_box_masks], [rpn_box]]
+            rcnn_acc_metric = [[cls_targets], [cls_pred]]
+            rcnn_l1_loss_metric = [[box_targets, box_masks], [box_pred]]
+
+            if args.amp:
+                with amp.scale_loss(total_loss, self._optimizer) as scaled_losses:
+                    autograd.backward(scaled_losses)
+            else:
+                total_loss.backward()
+
+        return rpn_loss1_metric, rpn_loss2_metric, rcnn_loss1_metric, rcnn_loss2_metric, \
+               rpn_acc_metric, rpn_l1_loss_metric, rcnn_acc_metric, rcnn_l1_loss_metric
+
+
+def train(net, train_data, val_data, eval_metric, batch_size, ctx, args):
     """Training pipeline"""
+    args.kv_store = 'device' if (args.amp and 'nccl' in args.kv_store) else args.kv_store
+    kv = mx.kvstore.create(args.kv_store)
     net.collect_params().setattr('grad_req', 'null')
     net.collect_train_params().setattr('grad_req', 'write')
+    optimizer_params = {'learning_rate': args.lr, 'wd': args.wd, 'momentum': args.momentum}
     if args.horovod:
         hvd.broadcast_parameters(net.collect_params(), root_rank=0)
         trainer = hvd.DistributedTrainer(
-                        net.collect_train_params(), # fix batchnorm, fix first stage, etc...
-                        'sgd',
-                        {'learning_rate': args.lr, 'wd': args.wd, 'momentum': args.momentum})
+            net.collect_train_params(),  # fix batchnorm, fix first stage, etc...
+            'sgd',
+            optimizer_params)
     else:
         trainer = gluon.Trainer(
-                    net.collect_train_params(), # fix batchnorm, fix first stage, etc...
-                    'sgd',
-                    {'learning_rate': args.lr, 'wd': args.wd, 'momentum': args.momentum},
-                    update_on_kvstore=(False if args.amp else None))
+            net.collect_train_params(),  # fix batchnorm, fix first stage, etc...
+            'sgd',
+            optimizer_params,
+            update_on_kvstore=(False if args.amp else None), kvstore=kv)
 
     if args.amp:
         amp.init_trainer(trainer)
@@ -375,6 +370,11 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
     best_map = [0]
     for epoch in range(args.start_epoch, args.epochs):
         mix_ratio = 1.0
+        if not args.disable_hybridization:
+            net.hybridize(static_alloc=args.static_alloc)
+        rcnn_task = ForwardBackwardTask(net, trainer, rpn_cls_loss, rpn_box_loss, rcnn_cls_loss,
+                                        rcnn_box_loss, mix_ratio=1.0)
+        executor = Parallel(args.executor_threads, rcnn_task) if not args.horovod else None
         if args.mixup:
             # TODO(zhreshold) only support evenly mixup now, target generator needs to be modified otherwise
             train_data._dataset._data.set_mixup(np.random.uniform, 0.5, 0.5)
@@ -391,82 +391,50 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
             metric.reset()
         tic = time.time()
         btic = time.time()
-        if not args.disable_hybridization:
-            net.hybridize(static_alloc=args.static_alloc)
         base_lr = trainer.learning_rate
+        rcnn_task.mix_ratio = mix_ratio
         for i, batch in enumerate(train_data):
             if epoch == 0 and i <= lr_warmup:
                 # adjust based on real percentage
-                new_lr = base_lr * get_lr_at_iter(i / lr_warmup)
+                new_lr = base_lr * get_lr_at_iter(i / lr_warmup, args.lr_warmup_factor)
                 if new_lr != trainer.learning_rate:
                     if i % args.log_interval == 0:
                         logger.info(
                             '[Epoch 0 Iteration {}] Set learning rate to {}'.format(i, new_lr))
                     trainer.set_learning_rate(new_lr)
             batch = split_and_load(batch, ctx_list=ctx)
-            batch_size = len(batch[0])
-            losses = []
             metric_losses = [[] for _ in metrics]
             add_losses = [[] for _ in metrics2]
-            with autograd.record():
-                for data, label, rpn_cls_targets, rpn_box_targets, rpn_box_masks in zip(*batch):
-                    gt_label = label[:, :, 4:5]
-                    gt_box = label[:, :, :4]
-                    cls_pred, box_pred, roi, samples, matches, rpn_score, rpn_box, anchors = net(
-                        data, gt_box)
-                    # losses of rpn
-                    rpn_score = rpn_score.squeeze(axis=-1)
-                    num_rpn_pos = (rpn_cls_targets >= 0).sum()
-                    rpn_loss1 = rpn_cls_loss(rpn_score, rpn_cls_targets,
-                                             rpn_cls_targets >= 0) * rpn_cls_targets.size / num_rpn_pos
-                    rpn_loss2 = rpn_box_loss(rpn_box, rpn_box_targets,
-                                             rpn_box_masks) * rpn_box.size / num_rpn_pos
-                    # rpn overall loss, use sum rather than average
-                    rpn_loss = rpn_loss1 + rpn_loss2
-                    # generate targets for rcnn
-                    cls_targets, box_targets, box_masks = net.target_generator(roi, samples,
-                                                                               matches, gt_label,
-                                                                               gt_box)
-                    # losses of rcnn
-                    num_rcnn_pos = (cls_targets >= 0).sum()
-                    rcnn_loss1 = rcnn_cls_loss(cls_pred, cls_targets,
-                                               cls_targets >= 0) * cls_targets.size / \
-                                 cls_targets.shape[0] / num_rcnn_pos
-                    rcnn_loss2 = rcnn_box_loss(box_pred, box_targets, box_masks) * box_pred.size / \
-                                 box_pred.shape[0] / num_rcnn_pos
-                    rcnn_loss = rcnn_loss1 + rcnn_loss2
-                    # overall losses
-                    losses.append(rpn_loss.sum() * mix_ratio + rcnn_loss.sum() * mix_ratio)
-                    if (not args.horovod or hvd.rank() == 0):
-                        metric_losses[0].append(rpn_loss1.sum() * mix_ratio)
-                        metric_losses[1].append(rpn_loss2.sum() * mix_ratio)
-                        metric_losses[2].append(rcnn_loss1.sum() * mix_ratio)
-                        metric_losses[3].append(rcnn_loss2.sum() * mix_ratio)
-                        add_losses[0].append([[rpn_cls_targets, rpn_cls_targets >= 0], [rpn_score]])
-                        add_losses[1].append([[rpn_box_targets, rpn_box_masks], [rpn_box]])
-                        add_losses[2].append([[cls_targets], [cls_pred]])
-                        add_losses[3].append([[box_targets, box_masks], [box_pred]])
-                if args.amp:
-                    with amp.scale_loss(losses, trainer) as scaled_losses:
-                        autograd.backward(scaled_losses)
+            if executor is not None:
+                for data in zip(*batch):
+                    executor.put(data)
+            for j in range(len(ctx)):
+                if executor is not None:
+                    result = executor.get()
                 else:
-                    autograd.backward(losses)
-                if (not args.horovod or hvd.rank() == 0):
-                    for metric, record in zip(metrics, metric_losses):
-                        metric.update(0, record)
-                    for metric, records in zip(metrics2, add_losses):
-                        for pred in records:
-                            metric.update(pred[0], pred[1])
-            trainer.step(len(losses))
+                    result = rcnn_task.forward_backward(list(zip(*batch))[0])
+                if (not args.horovod) or hvd.rank() == 0:
+                    for k in range(len(metric_losses)):
+                        metric_losses[k].append(result[k])
+                    for k in range(len(add_losses)):
+                        add_losses[k].append(result[len(metric_losses) + k])
+            for metric, record in zip(metrics, metric_losses):
+                metric.update(0, record)
+            for metric, records in zip(metrics2, add_losses):
+                for pred in records:
+                    metric.update(pred[0], pred[1])
+            trainer.step(batch_size)
+
             # update metrics
-            if (not args.horovod or hvd.rank() == 0) and args.log_interval and not (i + 1) % args.log_interval:
-                # msg = ','.join(['{}={:.3f}'.format(*metric.get()) for metric in metrics])
-                msg = ','.join(['{}={:.3f}'.format(*metric.get()) for metric in metrics + metrics2])
+            if (not args.horovod or hvd.rank() == 0) and args.log_interval \
+                    and not (i + 1) % args.log_interval:
+                msg = ','.join(
+                    ['{}={:.3f}'.format(*metric.get()) for metric in metrics + metrics2])
                 logger.info('[Epoch {}][Batch {}], Speed: {:.3f} samples/sec, {}'.format(
                     epoch, i, args.log_interval * args.batch_size / (time.time() - btic), msg))
                 btic = time.time()
 
-        if (not args.horovod or hvd.rank() == 0):
+        if (not args.horovod) or hvd.rank() == 0:
             msg = ','.join(['{}={:.3f}'.format(*metric.get()) for metric in metrics])
             logger.info('[Epoch {}] Training cost: {:.3f}, {}'.format(
                 epoch, (time.time() - tic), msg))
@@ -478,7 +446,8 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                 current_map = float(mean_ap[-1])
             else:
                 current_map = 0.
-            save_params(net, logger, best_map, current_map, epoch, args.save_interval, args.save_prefix)
+            save_params(net, logger, best_map, current_map, epoch, args.save_interval,
+                        args.save_prefix)
 
 
 if __name__ == '__main__':
@@ -495,11 +464,9 @@ if __name__ == '__main__':
     # training contexts
     if args.horovod:
         ctx = [mx.gpu(hvd.local_rank())]
-        args.batch_size = hvd.size()
     else:
         ctx = [mx.gpu(int(i)) for i in args.gpus.split(',') if i.strip()]
         ctx = ctx if ctx else [mx.cpu()]
-        args.batch_size = len(ctx)  # 1 batch per device
 
     # network
     kwargs = {}
@@ -512,7 +479,8 @@ if __name__ == '__main__':
             kwargs['num_devices'] = len(args.gpus.split(','))
     net_name = '_'.join(('faster_rcnn', *module_list, args.network, args.dataset))
     args.save_prefix += net_name
-    net = get_model(net_name, pretrained_base=True, **kwargs)
+    net = get_model(net_name, pretrained_base=True,
+                    per_device_batch_size=args.batch_size // len(ctx), **kwargs)
     if args.resume.strip():
         net.load_parameters(args.resume.strip())
     else:
@@ -523,12 +491,11 @@ if __name__ == '__main__':
     net.collect_params().reset_ctx(ctx)
 
     # training data
-
     train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
-    batch_size = 1 if args.horovod else args.batch_size
+    batch_size = args.batch_size // len(ctx) if args.horovod else args.batch_size
     train_data, val_data = get_dataloader(
         net, train_dataset, val_dataset, FasterRCNNDefaultTrainTransform,
-        FasterRCNNDefaultValTransform, batch_size, args)
+        FasterRCNNDefaultValTransform, batch_size, len(ctx), args)
 
     # training
-    train(net, train_data, val_data, eval_metric, ctx, args)
+    train(net, train_data, val_data, eval_metric, batch_size, ctx, args)

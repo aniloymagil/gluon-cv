@@ -3,6 +3,7 @@ from __future__ import absolute_import
 
 from mxnet import autograd
 from mxnet import gluon
+
 from ...nn.bbox import BBoxCornerToCenter, BBoxClipToImage
 from ...nn.coder import NormalizedBoxCenterDecoder
 
@@ -11,7 +12,7 @@ class RPNProposal(gluon.HybridBlock):
     """Proposal generator for RPN.
 
     RPNProposal takes RPN anchors, RPN prediction scores and box regression predictions.
-    It will transform anchors, apply NMS to get clean foreground proposals.
+    It will transform anchors, apply NMS (if set to true) to get clean foreground proposals.
 
     Parameters
     ----------
@@ -29,7 +30,7 @@ class RPNProposal(gluon.HybridBlock):
     def __init__(self, clip, min_size, stds):
         super(RPNProposal, self).__init__()
         self._box_to_center = BBoxCornerToCenter()
-        self._box_decoder = NormalizedBoxCenterDecoder(stds=stds, clip=clip)
+        self._box_decoder = NormalizedBoxCenterDecoder(stds=stds, clip=clip, convert_anchor=True)
         self._clipper = BBoxClipToImage()
         # self._compute_area = BBoxArea()
         self._min_size = min_size
@@ -37,11 +38,11 @@ class RPNProposal(gluon.HybridBlock):
     # pylint: disable=arguments-differ
     def hybrid_forward(self, F, anchor, score, bbox_pred, img):
         """
-        Generate proposals. Limit to batch-size=1 in current implementation.
+        Generate proposals.
         """
         with autograd.pause():
             # restore bounding boxes
-            roi = self._box_decoder(bbox_pred, self._box_to_center(anchor))
+            roi = self._box_decoder(bbox_pred, anchor)
 
             # clip rois to image's boundary
             # roi = F.Custom(roi, img, op_type='bbox_clip_to_image')
@@ -52,8 +53,8 @@ class RPNProposal(gluon.HybridBlock):
             # width = roi.slice_axis(axis=-1, begin=2, end=3)
             # height = roi.slice_axis(axis=-1, begin=3, end=None)
             xmin, ymin, xmax, ymax = roi.split(axis=-1, num_outputs=4)
-            width = xmax - xmin
-            height = ymax - ymin
+            width = xmax - xmin + 1.0
+            height = ymax - ymin + 1.0
             # TODO:(zhreshold), there's im_ratio to handle here, but it requires
             # add' info, and we don't expect big difference
             invalid = (width < self._min_size) + (height < self._min_size)
@@ -69,7 +70,7 @@ class RPNProposal(gluon.HybridBlock):
             #    F.broadcast_greater(aymax, hrange)
             # avoid invalid anchors suppress anchors with 0 confidence
             score = F.where(invalid, F.ones_like(invalid) * -1, score)
-            invalid = F.repeat(invalid, axis=-1, repeats=4)
+            invalid = F.broadcast_axes(invalid, axis=2, size=4)
             roi = F.where(invalid, F.ones_like(invalid) * -1, roi)
 
             pre = F.concat(score, roi, dim=-1)

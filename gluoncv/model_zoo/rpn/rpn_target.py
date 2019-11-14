@@ -1,12 +1,17 @@
 """Region Proposal Target Generator."""
 from __future__ import absolute_import
 
-import numpy as np
 import mxnet as mx
+import numpy as np
 from mxnet import autograd, gluon
 
 from ...nn.bbox import BBoxSplit
 from ...nn.coder import SigmoidClassEncoder, NumPyNormalizedBoxCenterEncoder
+
+try:
+    import gluoncv.model_zoo.rpn.cython_rpn_target as cython_rpn_target
+except ImportError:
+    cython_rpn_target = None
 
 
 class RPNTargetSampler(object):
@@ -15,7 +20,7 @@ class RPNTargetSampler(object):
     Parameters
     ----------
     num_sample : int
-        Number of samples for RCNN targets.
+        Number of samples for RPN targets.
     pos_iou_thresh : float
         Proposal whose IOU larger than ``pos_iou_thresh`` is regarded as positive samples.
     neg_iou_thresh : float
@@ -47,6 +52,9 @@ class RPNTargetSampler(object):
         matches: (num_anchors,) value [0, M).
 
         """
+        if cython_rpn_target is not None:
+            return cython_rpn_target.sampler(ious, self._pos_iou_thresh, self._neg_iou_thresh,
+                                             self._num_sample, self._max_pos, self._eps)
         matches = np.argmax(ious, axis=1)
 
         # samples init with 0 (ignore)
@@ -83,7 +91,6 @@ class RPNTargetSampler(object):
             disable_indices = np.random.choice(
                 np.where(samples < 0)[0], size=(num_neg - max_neg), replace=False)
             samples[disable_indices] = 0
-
         return samples, matches
 
 
@@ -160,6 +167,4 @@ class RPNTargetGenerator(gluon.Block):
             box_target, box_mask = self._box_encoder(
                 np.expand_dims(samples, axis=0), np.expand_dims(matches, axis=0),
                 np.expand_dims(anchor.asnumpy(), axis=0), np.expand_dims(bbox.asnumpy(), axis=0))
-        return mx.nd.array(cls_target, ctx=bbox.context), \
-               mx.nd.array(box_target[0], ctx=bbox.context), \
-               mx.nd.array(box_mask[0], ctx=bbox.context)
+        return cls_target, box_target[0], box_mask[0]

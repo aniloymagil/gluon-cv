@@ -10,11 +10,13 @@ Visualization of Inference Throughputs vs. Validation mAP of COCO pre-trained mo
 .. image:: /_static/plot_help.png
   :width: 100%
 
-.. include:: /_static/detection_throughputs.html
+.. raw:: html
+   :file: ../_static/detection_throughputs.html
 
 We also provide a detailed interactive analysis of all 80 object categories.
 
-.. include:: /_static/detection_coco_per_class.html
+.. raw:: html
+   :file: ../_static/detection_coco_per_class.html
 
 The following tables list pre-trained models for object detection
 and their performances with more details.
@@ -175,7 +177,7 @@ Checkout Faster-RCNN demo tutorial here: :ref:`sphx_glr_build_examples_detection
    +-------------------------------------------+-----------------+-----------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------+
    | faster_rcnn_resnet101_v1d_coco [2]_       | 40.1/60.9/43.3  | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/detection/faster_rcnn_resnet101_v1d_coco.sh>`_       | `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/detection/faster_rcnn_resnet101_v1d_coco_train.log>`_       |
    +-------------------------------------------+-----------------+-----------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------+
-   | faster_rcnn_fpn_resnet50_v1b_coco [4]_    | 38.5/60.1/41.6  | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/detection/faster_rcnn_fpn_resnet50_v1b_coco.sh>`_    | `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/detection/faster_rcnn_fpn_resnet50_v1b_coco_train.log>`_    |
+   | faster_rcnn_fpn_resnet50_v1b_coco [4]_    | 38.4/60.2/41.6  | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/detection/faster_rcnn_fpn_resnet50_v1b_coco.sh>`_    | `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/detection/faster_rcnn_fpn_resnet50_v1b_coco_train.log>`_    |
    +-------------------------------------------+-----------------+-----------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------+
    | faster_rcnn_fpn_resnet101_v1d_coco [4]_   | 40.8/62.4/44.7  | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/detection/faster_rcnn_fpn_resnet101_v1d_coco.sh>`_   | `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/detection/faster_rcnn_fpn_resnet101_v1d_coco_train.log>`_   |
    +-------------------------------------------+-----------------+-----------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------+
